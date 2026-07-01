@@ -3,6 +3,10 @@ import type { Modulo } from "../../core/module-registry";
 
 const router = Router();
 
+router.get("/health", (_req, res) => {
+    res.json({ modulo: "os-estoque", status: "ok" });
+});
+
 const TRANSICOES_VALIDAS: Record<string, string[]> = {
     recepcao: ["diagnostico", "cancelada"],
     diagnostico: ["aguardando_aprovacao", "cancelada"],
