@@ -30,6 +30,7 @@ services:
       - ./db/003_configuracao_oficina.sql:/docker-entrypoint-initdb.d/003_configuracao_oficina.sql:ro
       - ./db/004_notificacoes_controle.sql:/docker-entrypoint-initdb.d/004_notificacoes_controle.sql:ro
       - ./db/005_manutencao_preventiva.sql:/docker-entrypoint-initdb.d/005_manutencao_preventiva.sql:ro
+      - ./db/006_notificacoes_painel.sql:/docker-entrypoint-initdb.d/006_notificacoes_painel.sql:ro
 
 volumes:
   postgres_data:

@@ -6,6 +6,7 @@ import { gerarToken, exigirAdmin } from "../../core/auth";
 import { obterConfiguracao, salvarConfiguracao, type Segmento } from "../../core/config-oficina";
 import { SEGMENTO_LABEL, SEGMENTO_DESCRICAO } from "../../core/segmentos";
 import { listarPlanos, registrarManutencao, listarProximas } from "../../core/manutencao";
+import { contarNaoLidas, listar as listarNotificacoes, marcarTodasLidas } from "../../core/notificacoes-painel";
 import { layout } from "./layout";
 
 const router = Router();
@@ -267,8 +268,9 @@ router.get("/configuracao", exigirAdmin, async (req, res) => {
                     <label>Nome da oficina (aparece pro cliente no WhatsApp)</label>
                     <input type="text" name="nomeOficina" value="${config.nomeOficina}" required />
 
-                    <label>Número de WhatsApp da oficina (com DDI, ex: 5511999999999)</label>
+                    <label>WhatsApp para receber avisos (com DDI, ex: 5511999999999)</label>
                     <input type="text" name="whatsappNumero" value="${config.whatsappNumero ?? ""}" placeholder="5511999999999" />
+                    <p style="color:#6b7280;font-size:.8rem;margin:.3rem 0 0;">É pra este número que a oficina recebe o aviso de cada novo agendamento e de urgências.</p>
 
                     <button type="submit">Salvar</button>
                  </form>`
@@ -291,6 +293,60 @@ router.post("/configuracao", exigirAdmin, async (req, res) => {
     } catch (erro) {
         console.error("[admin] erro ao salvar configuracao:", erro);
         res.status(500).send("Erro ao salvar configuração.");
+    }
+});
+
+// Contagem de nao-lidas -- consumido pelo polling do sininho no layout.
+router.get("/notificacoes/count.json", exigirAdmin, async (_req, res) => {
+    try {
+        const total = await contarNaoLidas();
+        res.json({ total });
+    } catch (erro) {
+        console.error("[admin] erro ao contar notificacoes:", erro);
+        res.json({ total: 0 });
+    }
+});
+
+router.get("/notificacoes", exigirAdmin, async (_req, res) => {
+    try {
+        const itens = await listarNotificacoes(50);
+        await marcarTodasLidas(); // abrir a lista marca tudo como lido
+
+        const ICONE: Record<string, string> = { novo_agendamento: "🗓️", urgencia: "⚠️" };
+        const linhas =
+            itens
+                .map((n) => {
+                    const quando = new Date(n.created_at).toLocaleString("pt-BR", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                    });
+                    const titulo = n.link
+                        ? `<a href="${n.link}" target="_blank" style="text-decoration:none;">${n.titulo}</a>`
+                        : n.titulo;
+                    return `<div class="lista-item" style="${n.lida ? "" : "background:#12161f;margin:0 -1.5rem;padding:.6rem 1.5rem;"}">
+                        <div>
+                            <div><b>${ICONE[n.tipo] ?? "🔔"} ${titulo}</b></div>
+                            <div style="color:#9ca3af;font-size:.82rem;margin-top:.15rem;">${n.descricao ?? ""}</div>
+                        </div>
+                        <div style="color:#6b7280;font-size:.78rem;white-space:nowrap;margin-left:1rem;">${quando}</div>
+                    </div>`;
+                })
+                .join("") || '<p style="color:#6b7280;">Nenhuma notificação ainda.</p>';
+
+        res.send(
+            layout(
+                "Notificações",
+                `<h1 style="margin-top:0;">🔔 Notificações</h1>
+                 <p style="color:#9ca3af;margin-top:-.5rem;">Novos agendamentos e urgências que chegam pelo WhatsApp aparecem aqui.</p>
+                 <div class="card">${linhas}</div>
+                 <p style="margin-top:1.5rem;"><a class="sair" href="/admin">← Voltar ao painel</a></p>`
+            )
+        );
+    } catch (erro) {
+        console.error("[admin] erro ao listar notificacoes:", erro);
+        res.status(500).send("Erro ao carregar notificações.");
     }
 });
 

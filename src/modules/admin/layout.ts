@@ -20,6 +20,11 @@ const ESTILO = `
   table { width:100%; border-collapse:collapse; font-size:.9rem; }
   th, td { text-align:left; padding:.5rem .4rem; border-bottom:1px solid #1f222a; }
   th { color:#9ca3af; font-weight:600; }
+  .topo-acoes { display:flex; align-items:center; gap:1.1rem; }
+  .sino { position:relative; text-decoration:none; font-size:1.25rem; line-height:1; }
+  .sino-badge { position:absolute; top:-.5rem; right:-.6rem; min-width:1.1rem; height:1.1rem; padding:0 .25rem;
+    background:#ef4444; color:#fff; border-radius:999px; font-size:.7rem; font-weight:700; display:none;
+    align-items:center; justify-content:center; text-align:center; line-height:1.1rem; }
 `;
 
 export function layout(titulo: string, corpo: string, options?: { semTopo?: boolean }): string {
@@ -35,7 +40,28 @@ export function layout(titulo: string, corpo: string, options?: { semTopo?: bool
 ${
     options?.semTopo
         ? corpo
-        : `<div class="topo"><b>🔧 Painel Admin</b><a class="sair" href="/admin/logout">Sair</a></div><div class="conteudo">${corpo}</div>`
+        : `<div class="topo">
+             <b>🔧 Painel Admin</b>
+             <div class="topo-acoes">
+               <a class="sino" href="/admin/notificacoes" title="Notificações">🔔<span class="sino-badge" id="sino-badge">0</span></a>
+               <a class="sair" href="/admin/logout">Sair</a>
+             </div>
+           </div>
+           <div class="conteudo">${corpo}</div>
+           <script>
+             async function atualizarSino() {
+               try {
+                 const r = await fetch('/admin/notificacoes/count.json', { credentials: 'same-origin' });
+                 if (!r.ok) return;
+                 const d = await r.json();
+                 const b = document.getElementById('sino-badge');
+                 if (d.total > 0) { b.textContent = d.total > 99 ? '99+' : d.total; b.style.display = 'flex'; }
+                 else { b.style.display = 'none'; }
+               } catch (e) {}
+             }
+             atualizarSino();
+             setInterval(atualizarSino, 20000);
+           </script>`
 }
 </body>
 </html>`;

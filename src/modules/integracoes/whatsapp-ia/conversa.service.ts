@@ -1,11 +1,46 @@
 import { db } from "../../../core/db";
 import { obterConfiguracao, type Segmento } from "../../../core/config-oficina";
 import { PERGUNTA_EXTRA_TRIAGEM } from "../../../core/segmentos";
+import { criarNotificacao } from "../../../core/notificacoes-painel";
 import { enviarMensagem } from "./evolution-client";
 import { classificarSintoma, type Categoria } from "./triagem";
 import { buscarProximosHorarios, confirmarAgendamento } from "./agendamento.service";
 
 const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
+
+/**
+ * Avisa a oficina de um evento (novo agendamento / urgencia): grava no sininho
+ * do painel (PDV) E manda no WhatsApp da empresa, se o numero estiver configurado.
+ * Best-effort -- nunca deixa uma falha de notificacao quebrar o atendimento.
+ */
+async function notificarEmpresa(params: {
+    tipo: "novo_agendamento" | "urgencia";
+    titulo: string;
+    descricao: string;
+    referenciaId?: string | null;
+    link?: string | null;
+    whatsappNumero: string | null;
+    mensagemWhatsapp: string;
+}): Promise<void> {
+    try {
+        await criarNotificacao({
+            tipo: params.tipo,
+            titulo: params.titulo,
+            descricao: params.descricao,
+            referenciaId: params.referenciaId ?? null,
+            link: params.link ?? null,
+        });
+    } catch (erro) {
+        console.error("[whatsapp-ia] falha ao gravar notificacao do painel:", erro);
+    }
+    if (params.whatsappNumero) {
+        try {
+            await enviarMensagem(params.whatsappNumero, params.mensagemWhatsapp);
+        } catch (erro) {
+            console.error("[whatsapp-ia] falha ao notificar empresa no WhatsApp:", erro);
+        }
+    }
+}
 
 type Estado =
     | "inicio"
@@ -250,6 +285,25 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                         `Se o carro estiver parado na via, me avisa que já acionamos o guincho parceiro. Um consultor da ${NOME_OFICINA} entra em contato em instantes.`,
                     true
                 );
+
+                // Avisa a oficina AGORA (WhatsApp da empresa + sininho do PDV)
+                const { rows: cliRows } = await db.query<{ nome: string }>(
+                    "SELECT nome FROM clientes WHERE id = $1",
+                    [contexto.clienteId]
+                );
+                const nomeCli = cliRows[0]?.nome ?? "Cliente";
+                await notificarEmpresa({
+                    tipo: "urgencia",
+                    titulo: `⚠️ URGÊNCIA — ${nomeCli}`,
+                    descricao: `${contexto.veiculoDescricao ?? "veículo"} · ${texto}`.slice(0, 300),
+                    whatsappNumero: config.whatsappNumero,
+                    mensagemWhatsapp:
+                        `⚠️ *URGÊNCIA na ${NOME_OFICINA}*\n\n` +
+                        `Cliente: ${nomeCli} (${telefone})\n` +
+                        `Veículo: ${contexto.veiculoDescricao ?? "—"}\n` +
+                        `Relato: ${texto}\n\n` +
+                        `Precisa de atendimento imediato — o cliente foi avisado que um especialista vai chamar.`,
+                });
                 return;
             }
 
@@ -361,6 +415,29 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                     `Aqui está a confirmação: ${link}\n\n` +
                     `Vou te lembrar por aqui um pouco antes do horário. Se precisar cancelar, é só digitar *cancelar*. Até lá! 🔧`
             );
+
+            // Avisa a oficina do novo agendamento (WhatsApp da empresa + sininho do PDV)
+            const { rows: cliRows } = await db.query<{ nome: string }>(
+                "SELECT nome FROM clientes WHERE id = $1",
+                [contexto.clienteId]
+            );
+            const nomeCli = cliRows[0]?.nome ?? "Cliente";
+            const veic = contexto.veiculoDescricao ?? "veículo";
+            await notificarEmpresa({
+                tipo: "novo_agendamento",
+                titulo: `Novo agendamento — ${nomeCli}`,
+                descricao: `${veic} · ${formatarSlot(dataHora)} · ${sintomaCompleto || contexto.sintoma || ""}`.slice(0, 300),
+                referenciaId: resultado.id,
+                link,
+                whatsappNumero: config.whatsappNumero,
+                mensagemWhatsapp:
+                    `🗓️ *Novo agendamento na ${NOME_OFICINA}*\n\n` +
+                    `Cliente: ${nomeCli} (${telefone})\n` +
+                    `Veículo: ${veic}\n` +
+                    `Quando: ${formatarSlot(dataHora)}\n` +
+                    `Serviço: ${sintomaCompleto || contexto.sintoma || "—"}\n\n` +
+                    `Detalhes: ${link}`,
+            });
             return;
         }
 
