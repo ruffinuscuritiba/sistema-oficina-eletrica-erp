@@ -189,3 +189,21 @@ Estratégia central de retenção: cada serviço recorrente tem um intervalo de 
 **Nota de estimativa de km**: como a km do veículo só é conhecida no dia de cada serviço (não há telemetria contínua), o gatilho do lembrete é **por tempo** (`proxima_data`); o `proximo_km` fica registrado como referência e aparece na mensagem/painel, mas não dispara sozinho. Se no futuro a km passar a ser atualizada com frequência (ex.: a cada visita), dá pra adicionar um gatilho por km estimada.
 
 Validado local end-to-end: registro calcula próxima data/km corretos, job dispara mensagem personalizada ("Oi Roberto! seu Civic 2019 está chegando na hora da troca de óleo..."), idempotente, e a resposta do cliente reentra na triagem reconhecendo-o como recorrente. Deploy validado em produção (8 planos seed, página renderiza, backend estável).
+
+---
+
+## Notificações de agendamento/urgência (WhatsApp da empresa + sininho do PDV)
+
+Quando a IA confirma um agendamento (ou detecta urgência), a oficina é avisada por **dois canais**:
+1. **WhatsApp da empresa** — mensagem com resumo (cliente, veículo, quando, serviço, link) enviada para `configuracao_oficina.whatsapp_numero` (configurável em `/admin/configuracao` — o label deixa claro que é o número que recebe os avisos). Só envia se o número estiver preenchido.
+2. **Sininho do painel (PDV)** — grava em `notificacoes_painel`; o top bar do painel mostra um 🔔 com contagem de não-lidas.
+
+- **`db/006_notificacoes_painel.sql`**: `notificacoes_painel` (tipo/titulo/descricao/referencia_id/link/lida). Distinta de `integracao_whatsapp_log` (auditoria de conversa) e `notificacoes_enviadas` (idempotência de jobs) — esta é pro operador ver na tela.
+- **`src/core/notificacoes-painel.ts`**: `criarNotificacao`/`contarNaoLidas`/`listar`/`marcarTodasLidas`.
+- **`conversa.service.ts` → `notificarEmpresa()`**: helper best-effort chamado no bloco de agendamento confirmado e no de urgência. Grava no painel + envia WhatsApp; nunca deixa falha de notificação quebrar o atendimento.
+- **`layout.ts`**: sino no top bar com badge; script de polling a cada 20s bate em `GET /admin/notificacoes/count.json`.
+- **`admin/index.ts`**: `GET /admin/notificacoes/count.json` (contagem pro polling) + `GET /admin/notificacoes` (lista e **marca tudo como lido ao abrir**).
+
+Validado em produção: fluxo de agendamento e de urgência disparam os dois canais; sininho conta e zera ao abrir a lista; mensagem completa chega no WhatsApp da empresa. Dados de teste limpos e config resetada pro onboarding.
+
+**Nota sobre o link de confirmação** (`/agendamento/:id`): funciona (testado 200 em produção com UUID real). O `{id}` que aparece na doc é só placeholder — o link real gerado por cada agendamento usa o UUID de verdade. IDs inválidos/inexistentes caem numa página amigável ("Link inválido"/"não encontrado"), não em erro.
