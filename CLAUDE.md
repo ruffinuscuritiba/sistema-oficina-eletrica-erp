@@ -172,3 +172,20 @@ Sistema deployado no VPS compartilhado (`oficina-api.srv1747711.hstgr.cloud`, pr
 2. **Colisão de DNS com outro projeto no mesmo VPS**: o serviço Postgres no `docker-compose.yml` usava o nome genérico `postgres:` (chave do YAML) — só que OUTRO projeto Docker Compose na mesma rede externa `proxy` **também** usa esse nome, e o DNS interno do Docker passou a alternar (round-robin) entre os dois containers Postgres diferentes a cada conexão. Resultado: erro `password authentication failed` **intermitente** (~80% das vezes), porque a conexão ia parar no Postgres errado (de outro sistema). Diagnóstico: `getent hosts postgres` de dentro do container retornava IPs diferentes a cada chamada. **Corrigido**: serviço renomeado para `oficina-postgres:` (nome único), com `depends_on` e `DATABASE_URL` atualizados — ver memória `project_multi_vertical_vps.md` para o procedimento completo (vale pra qualquer projeto futuro nesse VPS).
 
 Depois dos dois fixes: 8/8 requisições consecutivas com `200 OK`, `0` reinícios do container, dado do seed (usuário admin) preservado através da recriação do container.
+
+---
+
+## Manutenção preventiva (a IA traz o cliente de volta sozinha)
+
+Estratégia central de retenção: cada serviço recorrente tem um intervalo de desgaste (por km, por tempo, ou os dois). Quando o serviço é registrado, o sistema já agenda o próximo lembrete; um job diário verifica quem está chegando na hora e a IA dispara uma mensagem consultiva convidando pra revisão. Se o cliente responder, cai no fluxo normal de triagem/agendamento — o ciclo se fecha sozinho.
+
+- **`db/005_manutencao_preventiva.sql`**: `planos_manutencao` (catálogo de tipos recorrentes com `intervalo_km`/`intervalo_meses`/`segmentos[]`/`mensagem_template`, 8 planos seed) + `manutencoes_realizadas` (registro do serviço feito + `proximo_km`/`proxima_data`/`status`).
+- **`src/core/manutencao.ts`**: `registrarManutencao()` — **ponto de entrada único**. Calcula `proxima_data = hoje + intervalo_meses` e `proximo_km = km + intervalo_km`. É aqui que o módulo `os-estoque` deve chamar quando uma OS for marcada entregue (hoje é chamado pela tela do admin). `listarPlanos(segmento)` filtra pelos planos aplicáveis ao segmento contratado. `listarProximas()` para o painel.
+- **`src/core/jobs.ts` → `enviarLembretesPreventivos()`**: gatilho `proxima_data <= hoje + 10 dias` e `status = 'pendente_lembrete'`. Substitui `{nome}`/`{veiculo}`/`{servico}` no template. Idempotente por dois caminhos (`status → 'lembrete_enviado'` + `notificacoes_enviadas` com `tipo='lembrete_preventivo'`).
+- **Painel admin**: `GET /admin/manutencao` (form de registrar serviço com dropdown de veículos + planos do segmento + km, e lista das próximas revisões) + `POST /admin/manutencao/registrar`. KPI "Revisões preventivas a lembrar" no dashboard.
+
+**Planos seed** (intervalos aproximados de praxe): troca_oleo (10.000km/12m), alinhamento (10.000km/12m), pastilha_freio (30.000km/24m), correia_dentada (50.000km/48m), fluido_freio (40.000km/24m) — mecânica/integrado; bateria (30m), revisao_eletrica (20.000km/12m), higienizacao_ar (12m) — elétrica/integrado.
+
+**Nota de estimativa de km**: como a km do veículo só é conhecida no dia de cada serviço (não há telemetria contínua), o gatilho do lembrete é **por tempo** (`proxima_data`); o `proximo_km` fica registrado como referência e aparece na mensagem/painel, mas não dispara sozinho. Se no futuro a km passar a ser atualizada com frequência (ex.: a cada visita), dá pra adicionar um gatilho por km estimada.
+
+Validado local end-to-end: registro calcula próxima data/km corretos, job dispara mensagem personalizada ("Oi Roberto! seu Civic 2019 está chegando na hora da troca de óleo..."), idempotente, e a resposta do cliente reentra na triagem reconhecendo-o como recorrente. Deploy validado em produção (8 planos seed, página renderiza, backend estável).
