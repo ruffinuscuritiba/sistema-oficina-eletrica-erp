@@ -6,6 +6,12 @@ services:
     environment:
       PORT: 3000
       DATABASE_URL: postgres://oficina:oficina@postgres:5432/oficina
+      PUBLIC_URL: http://localhost:3000
+      EVOLUTION_API_URL:
+      EVOLUTION_API_KEY:
+      EVOLUTION_INSTANCE_NAME:
+      OFICINA_NOME: Oficina & Auto Elétrica
+      OFICINA_WHATSAPP_NUMERO:
     depends_on:
       - postgres
 
@@ -20,6 +26,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./db/002_atendimento_ia.sql:/docker-entrypoint-initdb.d/002_atendimento_ia.sql:ro
 
 volumes:
   postgres_data:
