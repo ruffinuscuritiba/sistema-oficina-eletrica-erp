@@ -27,6 +27,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./db/002_atendimento_ia.sql:/docker-entrypoint-initdb.d/002_atendimento_ia.sql:ro
+      - ./db/003_configuracao_oficina.sql:/docker-entrypoint-initdb.d/003_configuracao_oficina.sql:ro
+      - ./db/004_notificacoes_controle.sql:/docker-entrypoint-initdb.d/004_notificacoes_controle.sql:ro
+      - ./db/005_manutencao_preventiva.sql:/docker-entrypoint-initdb.d/005_manutencao_preventiva.sql:ro
 
 volumes:
   postgres_data:

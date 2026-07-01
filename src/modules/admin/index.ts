@@ -5,6 +5,7 @@ import { db } from "../../core/db";
 import { gerarToken, exigirAdmin } from "../../core/auth";
 import { obterConfiguracao, salvarConfiguracao, type Segmento } from "../../core/config-oficina";
 import { SEGMENTO_LABEL, SEGMENTO_DESCRICAO } from "../../core/segmentos";
+import { listarPlanos, registrarManutencao, listarProximas } from "../../core/manutencao";
 import { layout } from "./layout";
 
 const router = Router();
@@ -68,9 +69,10 @@ router.get("/", exigirAdmin, async (_req, res) => {
         const config = await obterConfiguracao();
         if (!config.configuradoEm) return res.redirect("/admin/configuracao?onboarding=1");
 
-        const [{ rows: hojeRows }, { rows: urgentesRows }, { rows: clientesRows }, { rows: proximos }] = await Promise.all([
+        const [{ rows: hojeRows }, { rows: urgentesRows }, { rows: preventivosRows }, { rows: clientesRows }, { rows: proximos }] = await Promise.all([
             db.query("SELECT COUNT(*)::int AS total FROM agendamentos WHERE data_hora::date = CURRENT_DATE AND status IN ('confirmado','lembrete_enviado')"),
             db.query("SELECT COUNT(*)::int AS total FROM atendimento_conversas WHERE estado = 'urgente_transferido' AND ultima_interacao > now() - interval '24 hours'"),
+            db.query("SELECT COUNT(*)::int AS total FROM manutencoes_realizadas WHERE status = 'pendente_lembrete' AND proxima_data <= CURRENT_DATE + interval '10 days'"),
             db.query("SELECT COUNT(*)::int AS total FROM clientes WHERE deleted_at IS NULL"),
             db.query(
                 `SELECT a.id, a.data_hora, a.categoria, a.sintoma, a.status, c.nome AS cliente_nome, v.modelo AS veiculo_modelo
@@ -104,6 +106,7 @@ router.get("/", exigirAdmin, async (_req, res) => {
                  <div class="grid" style="margin-bottom:1.5rem;">
                     <div class="card"><div class="kpi">${hojeRows[0].total}</div><div class="kpi-label">Agendamentos hoje</div></div>
                     <div class="card"><div class="kpi" style="color:${urgentesRows[0].total > 0 ? "#ef4444" : "#f5f5f5"}">${urgentesRows[0].total}</div><div class="kpi-label">Urgências (24h)</div></div>
+                    <div class="card"><div class="kpi" style="color:${preventivosRows[0].total > 0 ? "#3b82f6" : "#f5f5f5"}">${preventivosRows[0].total}</div><div class="kpi-label">Revisões preventivas a lembrar</div></div>
                     <div class="card"><div class="kpi">${clientesRows[0].total}</div><div class="kpi-label">Clientes cadastrados</div></div>
                  </div>
 
@@ -115,12 +118,125 @@ router.get("/", exigirAdmin, async (_req, res) => {
                     </table>
                  </div>
 
-                 <p style="margin-top:1.5rem;"><a class="sair" href="/admin/configuracao">⚙️ Configurações da oficina</a></p>`
+                 <p style="margin-top:1.5rem;">
+                    <a class="sair" href="/admin/manutencao">🔧 Manutenção preventiva</a>
+                    &nbsp;·&nbsp;
+                    <a class="sair" href="/admin/configuracao">⚙️ Configurações da oficina</a>
+                 </p>`
             )
         );
     } catch (erro) {
         console.error("[admin] erro no dashboard:", erro);
         res.status(500).send("Erro ao carregar o painel.");
+    }
+});
+
+router.get("/manutencao", exigirAdmin, async (req, res) => {
+    try {
+        const config = await obterConfiguracao();
+        const [planos, proximas, { rows: veiculos }] = await Promise.all([
+            listarPlanos(config.segmento),
+            listarProximas(30),
+            db.query<{ id: string; label: string }>(
+                `SELECT v.id, (COALESCE(v.marca || ' ', '') || COALESCE(v.modelo, 'veículo') ||
+                        ' — ' || c.nome || ' (' || c.telefone || ')') AS label
+                 FROM veiculos v
+                 JOIN clientes c ON c.id = v.cliente_id
+                 WHERE v.deleted_at IS NULL AND c.deleted_at IS NULL
+                 ORDER BY v.created_at DESC LIMIT 200`
+            ),
+        ]);
+
+        const sucesso = req.query.ok ? '<div class="card" style="border-color:#22c55e;">✅ Serviço registrado! O lembrete da próxima revisão já está agendado.</div>' : "";
+
+        const veiculoOpcoes = veiculos.map((v) => `<option value="${v.id}">${v.label}</option>`).join("");
+        const planoOpcoes = planos
+            .map((p) => {
+                const intervalo = [
+                    p.intervalo_km ? `${p.intervalo_km.toLocaleString("pt-BR")} km` : null,
+                    p.intervalo_meses ? `${p.intervalo_meses} meses` : null,
+                ]
+                    .filter(Boolean)
+                    .join(" ou ");
+                return `<option value="${p.id}">${p.nome} (a cada ${intervalo})</option>`;
+            })
+            .join("");
+
+        const linhas = proximas
+            .map((m: any) => {
+                const quando = m.proxima_data
+                    ? new Date(m.proxima_data).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" })
+                    : "—";
+                const badge =
+                    m.status === "lembrete_enviado"
+                        ? '<span class="badge" style="background:#22c55e22;color:#22c55e">Lembrete enviado</span>'
+                        : '<span class="badge" style="background:#3b82f622;color:#3b82f6">Aguardando</span>';
+                return `<tr>
+                    <td>${quando}</td>
+                    <td>${m.cliente_nome}</td>
+                    <td>${m.veiculo_modelo ?? "—"}</td>
+                    <td>${m.servico}</td>
+                    <td>${badge}</td>
+                </tr>`;
+            })
+            .join("");
+
+        res.send(
+            layout(
+                "Manutenção preventiva",
+                `${sucesso}
+                 <h1 style="margin-top:0;">Manutenção preventiva</h1>
+                 <p style="color:#9ca3af;margin-top:-.5rem;">Registre um serviço feito e o sistema avisa o cliente sozinho quando estiver na hora da próxima revisão.</p>
+
+                 <div class="card">
+                    <h3 style="margin-top:0;">Registrar serviço realizado</h3>
+                    ${
+                        veiculos.length === 0
+                            ? '<p style="color:#9ca3af;">Nenhum veículo cadastrado ainda. Os veículos aparecem aqui automaticamente conforme os clientes chegam pelo WhatsApp.</p>'
+                            : `<form method="POST" action="/admin/manutencao/registrar">
+                                <label>Veículo</label>
+                                <select name="veiculoId" required>${veiculoOpcoes}</select>
+                                <label>Serviço realizado</label>
+                                <select name="planoId" required>${planoOpcoes}</select>
+                                <label>Quilometragem atual (opcional)</label>
+                                <input type="number" name="kmAtual" placeholder="Ex: 45000" min="0" />
+                                <button type="submit">Registrar e agendar lembrete</button>
+                              </form>`
+                    }
+                 </div>
+
+                 <div class="card">
+                    <h3 style="margin-top:0;">Próximas revisões a lembrar</h3>
+                    <table>
+                        <thead><tr><th>Quando</th><th>Cliente</th><th>Veículo</th><th>Serviço</th><th>Status</th></tr></thead>
+                        <tbody>${linhas || '<tr><td colspan="5" style="color:#6b7280;">Nenhuma revisão programada ainda. Registre um serviço acima.</td></tr>'}</tbody>
+                    </table>
+                 </div>
+
+                 <p style="margin-top:1.5rem;"><a class="sair" href="/admin">← Voltar ao painel</a></p>`
+            )
+        );
+    } catch (erro) {
+        console.error("[admin] erro na manutencao:", erro);
+        res.status(500).send("Erro ao carregar manutenção preventiva.");
+    }
+});
+
+router.post("/manutencao/registrar", exigirAdmin, async (req, res) => {
+    try {
+        const { veiculoId, planoId, kmAtual } = req.body ?? {};
+        if (!veiculoId || !planoId) return res.redirect("/admin/manutencao");
+
+        const { rows } = await db.query<{ cliente_id: string }>("SELECT cliente_id FROM veiculos WHERE id = $1", [veiculoId]);
+        const clienteId = rows[0]?.cliente_id;
+        if (!clienteId) return res.redirect("/admin/manutencao");
+
+        const km = kmAtual ? parseInt(kmAtual, 10) : null;
+        await registrarManutencao({ veiculoId, clienteId, planoId, kmAtual: Number.isFinite(km as number) ? km : null });
+        res.redirect("/admin/manutencao?ok=1");
+    } catch (erro) {
+        console.error("[admin] erro ao registrar manutencao:", erro);
+        res.status(500).send("Erro ao registrar serviço.");
     }
 });
 
