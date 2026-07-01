@@ -35,44 +35,51 @@ function pagina(titulo: string, corpo: string): string {
 }
 
 router.get("/:id", async (req, res) => {
-    const { rows } = await db.query(
-        `SELECT a.id, a.data_hora, a.periodo, a.status, a.sintoma,
-                c.nome AS cliente_nome, v.modelo AS veiculo_modelo, v.placa AS veiculo_placa
-         FROM agendamentos a
-         JOIN clientes c ON c.id = a.cliente_id
-         LEFT JOIN veiculos v ON v.id = a.veiculo_id
-         WHERE a.id = $1`,
-        [req.params.id]
-    );
-
-    const ag = rows[0];
-    if (!ag) {
-        res.status(404).send(
-            pagina("Agendamento não encontrado", `<h1>Agendamento não encontrado</h1><p>Confira o link recebido no WhatsApp.</p>`)
+    try {
+        const { rows } = await db.query(
+            `SELECT a.id, a.data_hora, a.periodo, a.status, a.sintoma,
+                    c.nome AS cliente_nome, v.modelo AS veiculo_modelo, v.placa AS veiculo_placa
+             FROM agendamentos a
+             JOIN clientes c ON c.id = a.cliente_id
+             LEFT JOIN veiculos v ON v.id = a.veiculo_id
+             WHERE a.id = $1`,
+            [req.params.id]
         );
-        return;
+
+        const ag = rows[0];
+        if (!ag) {
+            res.status(404).send(
+                pagina("Agendamento não encontrado", `<h1>Agendamento não encontrado</h1><p>Confira o link recebido no WhatsApp.</p>`)
+            );
+            return;
+        }
+
+        const status = STATUS_LABEL[ag.status] ?? { texto: ag.status, cor: "#9ca3af" };
+        const dataFormatada = new Date(ag.data_hora).toLocaleString("pt-BR", {
+            weekday: "long",
+            day: "2-digit",
+            month: "long",
+            hour: "2-digit",
+            minute: "2-digit",
+        });
+
+        res.send(
+            pagina(
+                "Confirmação de agendamento",
+                `<span class="badge" style="background:${status.cor}22; color:${status.cor}">${status.texto}</span>
+                 <h1>Olá, ${ag.cliente_nome}!</h1>
+                 <div class="linha"><span>Data e hora</span><span>${dataFormatada}</span></div>
+                 ${ag.veiculo_modelo ? `<div class="linha"><span>Veículo</span><span>${ag.veiculo_modelo}${ag.veiculo_placa && ag.veiculo_placa !== "A_INFORMAR" ? " · " + ag.veiculo_placa : ""}</span></div>` : ""}
+                 <div class="linha"><span>Relato</span><span>${(ag.sintoma ?? "").slice(0, 60)}</span></div>
+                 <p class="rodape">Precisa remarcar ou cancelar? É só mandar uma mensagem no WhatsApp da oficina.</p>`
+            )
+        );
+    } catch (erro) {
+        console.error("[agendamento-publico] erro:", erro);
+        res.status(400).send(
+            pagina("Link inválido", `<h1>Link inválido</h1><p>Confira o link recebido no WhatsApp.</p>`)
+        );
     }
-
-    const status = STATUS_LABEL[ag.status] ?? { texto: ag.status, cor: "#9ca3af" };
-    const dataFormatada = new Date(ag.data_hora).toLocaleString("pt-BR", {
-        weekday: "long",
-        day: "2-digit",
-        month: "long",
-        hour: "2-digit",
-        minute: "2-digit",
-    });
-
-    res.send(
-        pagina(
-            "Confirmação de agendamento",
-            `<span class="badge" style="background:${status.cor}22; color:${status.cor}">${status.texto}</span>
-             <h1>Olá, ${ag.cliente_nome}!</h1>
-             <div class="linha"><span>Data e hora</span><span>${dataFormatada}</span></div>
-             ${ag.veiculo_modelo ? `<div class="linha"><span>Veículo</span><span>${ag.veiculo_modelo}${ag.veiculo_placa && ag.veiculo_placa !== "A_INFORMAR" ? " · " + ag.veiculo_placa : ""}</span></div>` : ""}
-             <div class="linha"><span>Relato</span><span>${(ag.sintoma ?? "").slice(0, 60)}</span></div>
-             <p class="rodape">Precisa remarcar ou cancelar? É só mandar uma mensagem no WhatsApp da oficina.</p>`
-        )
-    );
 });
 
 const modulo: Modulo = { prefixo: "/agendamento", router };
