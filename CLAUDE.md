@@ -160,3 +160,15 @@ E2E validado via curl simulando payloads Evolution API:
 - Página pública `/agendamento/:id` renderiza status/dados corretos
 
 **Pendente (fora do escopo desta sessão)**: `os-estoque` ainda é scaffold (TODOs, não grava no banco de verdade) — o job de avaliação pós-serviço está pronto e testado, mas só vai disparar de verdade quando as ordens de serviço passarem a ser gravadas via `PATCH /os-estoque/os/:id/status` real (hoje é só stub). Conexão real com WhatsApp (Evolution API + QR code do número da oficina) não foi feita nesta sessão — segue o mesmo procedimento já documentado pro Kely no food-system-Sas-ERP.
+
+---
+
+## Deploy em produção (01/07/2026) — 2 bugs críticos corrigidos
+
+Sistema deployado no VPS compartilhado (`oficina-api.srv1747711.hstgr.cloud`, projeto Docker `/docker/oficina-eletrica-erp/`, container `oficina-eletrica-erp-backend-1` + `oficina-eletrica-postgres`). Dois bugs sérios apareceram só em produção (não reproduziam local) e foram corrigidos:
+
+1. **Handlers `async` sem try/catch derrubavam o processo inteiro**: Express 4 não encaminha rejeição de promise de rota `async` pro error-middleware sozinho. Um erro dentro de `/admin/login` ou `/admin` (ou `/agendamento/:id`) matava o processo Node com `ExitCode=0` (saída "limpa" do ponto de vista do Docker, mas sem log nenhum) e o `restart:unless-stopped` reiniciava o container silenciosamente, causando 502 no Traefik bem na hora do request. **Corrigido**: todos os handlers `async` têm try/catch próprio + error-middleware global (4 args) + `process.on('unhandledRejection'|'uncaughtException')` como última rede de segurança (`src/index.ts`).
+
+2. **Colisão de DNS com outro projeto no mesmo VPS**: o serviço Postgres no `docker-compose.yml` usava o nome genérico `postgres:` (chave do YAML) — só que OUTRO projeto Docker Compose na mesma rede externa `proxy` **também** usa esse nome, e o DNS interno do Docker passou a alternar (round-robin) entre os dois containers Postgres diferentes a cada conexão. Resultado: erro `password authentication failed` **intermitente** (~80% das vezes), porque a conexão ia parar no Postgres errado (de outro sistema). Diagnóstico: `getent hosts postgres` de dentro do container retornava IPs diferentes a cada chamada. **Corrigido**: serviço renomeado para `oficina-postgres:` (nome único), com `depends_on` e `DATABASE_URL` atualizados — ver memória `project_multi_vertical_vps.md` para o procedimento completo (vale pra qualquer projeto futuro nesse VPS).
+
+Depois dos dois fixes: 8/8 requisições consecutivas com `200 OK`, `0` reinícios do container, dado do seed (usuário admin) preservado através da recriação do container.
