@@ -15,3 +15,7 @@ pnpm-debug.log*
 Thumbs.db
 
 .vercel
+
+.claude/
+Anotações/
+*.pdf

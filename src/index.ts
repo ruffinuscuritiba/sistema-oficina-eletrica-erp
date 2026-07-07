@@ -34,6 +34,7 @@ registrarModulos(app, [
     require("./modules/integracoes/whatsapp-ia").default,
     require("./modules/agendamento-publico").default,
     require("./modules/admin").default,
+    require("./modules/super-admin").default,
 ]);
 
 // Error handler global (4 argumentos = Express reconhece como middleware de erro).

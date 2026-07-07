@@ -16,6 +16,8 @@ export interface TokenPayload {
     usuarioId: string;
     email: string;
     papel: string;
+    /** null so para papel = 'super_admin' -- todo outro papel pertence a uma oficina. */
+    oficinaId: string | null;
 }
 
 export function gerarToken(payload: TokenPayload): string {
@@ -46,6 +48,20 @@ export function exigirAdmin(req: Request, res: Response, next: NextFunction): vo
 
     if (!payload) {
         res.redirect("/admin/login");
+        return;
+    }
+
+    req.usuario = payload;
+    next();
+}
+
+/** Middleware: exige cookie "admin_token" valido com papel = 'super_admin'. */
+export function exigirSuperAdmin(req: Request, res: Response, next: NextFunction): void {
+    const token = req.cookies?.admin_token;
+    const payload = token ? verificarToken(token) : null;
+
+    if (!payload || payload.papel !== "super_admin") {
+        res.redirect("/super-admin/login");
         return;
     }
 

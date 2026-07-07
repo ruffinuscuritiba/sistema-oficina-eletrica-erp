@@ -32,21 +32,85 @@ router.get("/login", (req, res) => {
     );
 });
 
+interface CandidatoLogin {
+    id: string;
+    senha_hash: string;
+    email: string;
+    papel: string;
+    ativo: boolean;
+    oficina_id: string;
+    oficina_nome: string;
+    oficina_ativa: boolean;
+}
+
 router.post("/login", async (req, res) => {
     try {
-        const { email, senha } = req.body ?? {};
+        const { email, senha, oficinaId } = req.body ?? {};
         if (!email || !senha) return res.redirect("/admin/login?erro=1");
 
-        const { rows } = await db.query<{ id: string; senha_hash: string; email: string; papel: string; ativo: boolean }>(
-            "SELECT id, senha_hash, email, papel, ativo FROM usuarios WHERE email = $1",
+        // E-mail e unico POR OFICINA (nao mais global) -- uma mesma pessoa
+        // pode ter conta em 2+ lojas com o mesmo e-mail. JOIN com oficinas
+        // tambem bloqueia login de loja desativada pelo super-admin.
+        const { rows } = await db.query<CandidatoLogin>(
+            `SELECT u.id, u.senha_hash, u.email, u.papel, u.ativo,
+                    u.oficina_id, o.nome AS oficina_nome, o.ativo AS oficina_ativa
+             FROM usuarios u
+             JOIN oficinas o ON o.id = u.oficina_id
+             WHERE u.email = $1 AND u.papel != 'super_admin'`,
             [email]
         );
-        const usuario = rows[0];
-        if (!usuario || !usuario.ativo || !(await bcrypt.compare(senha, usuario.senha_hash))) {
+
+        const candidatos = rows.filter((u) => u.ativo && u.oficina_ativa);
+        if (candidatos.length === 0) return res.redirect("/admin/login?erro=1");
+
+        let selecionado = candidatos[0];
+        if (candidatos.length > 1) {
+            if (oficinaId) {
+                const encontrado = candidatos.find((u) => u.oficina_id === oficinaId);
+                if (!encontrado) return res.redirect("/admin/login?erro=1");
+                selecionado = encontrado;
+            } else {
+                // Caso raro: mesmo e-mail cadastrado em 2+ lojas -- pede pra escolher qual,
+                // sem guardar a senha em campo oculto (o usuario redigita ao confirmar).
+                const opcoes = candidatos
+                    .map(
+                        (u) =>
+                            `<label style="display:block;border:1px solid #2b2f3a;border-radius:12px;padding:.8rem 1rem;margin-top:.6rem;cursor:pointer;">
+                                <input type="radio" name="oficinaId" value="${u.oficina_id}" style="width:auto;display:inline;margin-right:.5rem;" required />
+                                ${u.oficina_nome}
+                            </label>`
+                    )
+                    .join("");
+                return res.send(
+                    layout(
+                        "Selecione a loja — Painel Admin",
+                        `<div style="max-width:360px;margin:4rem auto 0;">
+                            <h2 style="text-align:center;margin-bottom:.5rem;">🔧 Qual loja?</h2>
+                            <p style="color:#9ca3af;font-size:.85rem;text-align:center;margin-bottom:1rem;">Esse e-mail está cadastrado em mais de uma oficina.</p>
+                            <form method="POST" action="/admin/login">
+                                <input type="hidden" name="email" value="${email}" />
+                                ${opcoes}
+                                <label>Senha</label>
+                                <input type="password" name="senha" required />
+                                <button type="submit" style="width:100%;">Entrar</button>
+                            </form>
+                        </div>`,
+                        { semTopo: true }
+                    )
+                );
+            }
+        }
+
+        if (!(await bcrypt.compare(senha, selecionado.senha_hash))) {
             return res.redirect("/admin/login?erro=1");
         }
 
-        const token = gerarToken({ usuarioId: usuario.id, email: usuario.email, papel: usuario.papel });
+        const token = gerarToken({
+            usuarioId: selecionado.id,
+            email: selecionado.email,
+            papel: selecionado.papel,
+            oficinaId: selecionado.oficina_id,
+        });
         res.cookie("admin_token", token, {
             httpOnly: true,
             sameSite: "lax",
@@ -65,23 +129,34 @@ router.get("/logout", (_req, res) => {
     res.redirect("/admin/login");
 });
 
-router.get("/", exigirAdmin, async (_req, res) => {
+router.get("/", exigirAdmin, async (req, res) => {
     try {
-        const config = await obterConfiguracao();
+        const oficinaId = req.usuario!.oficinaId!;
+        const config = await obterConfiguracao(oficinaId);
         if (!config.configuradoEm) return res.redirect("/admin/configuracao?onboarding=1");
 
         const [{ rows: hojeRows }, { rows: urgentesRows }, { rows: preventivosRows }, { rows: clientesRows }, { rows: proximos }] = await Promise.all([
-            db.query("SELECT COUNT(*)::int AS total FROM agendamentos WHERE data_hora::date = CURRENT_DATE AND status IN ('confirmado','lembrete_enviado')"),
-            db.query("SELECT COUNT(*)::int AS total FROM atendimento_conversas WHERE estado = 'urgente_transferido' AND ultima_interacao > now() - interval '24 hours'"),
-            db.query("SELECT COUNT(*)::int AS total FROM manutencoes_realizadas WHERE status = 'pendente_lembrete' AND proxima_data <= CURRENT_DATE + interval '10 days'"),
-            db.query("SELECT COUNT(*)::int AS total FROM clientes WHERE deleted_at IS NULL"),
+            db.query(
+                "SELECT COUNT(*)::int AS total FROM agendamentos WHERE oficina_id = $1 AND data_hora::date = CURRENT_DATE AND status IN ('confirmado','lembrete_enviado')",
+                [oficinaId]
+            ),
+            db.query(
+                "SELECT COUNT(*)::int AS total FROM atendimento_conversas WHERE oficina_id = $1 AND estado = 'urgente_transferido' AND ultima_interacao > now() - interval '24 hours'",
+                [oficinaId]
+            ),
+            db.query(
+                "SELECT COUNT(*)::int AS total FROM manutencoes_realizadas WHERE oficina_id = $1 AND status = 'pendente_lembrete' AND proxima_data <= CURRENT_DATE + interval '10 days'",
+                [oficinaId]
+            ),
+            db.query("SELECT COUNT(*)::int AS total FROM clientes WHERE oficina_id = $1 AND deleted_at IS NULL", [oficinaId]),
             db.query(
                 `SELECT a.id, a.data_hora, a.categoria, a.sintoma, a.status, c.nome AS cliente_nome, v.modelo AS veiculo_modelo
                  FROM agendamentos a
                  JOIN clientes c ON c.id = a.cliente_id
                  LEFT JOIN veiculos v ON v.id = a.veiculo_id
-                 WHERE a.status IN ('confirmado', 'lembrete_enviado') AND a.data_hora >= now()
-                 ORDER BY a.data_hora ASC LIMIT 20`
+                 WHERE a.oficina_id = $1 AND a.status IN ('confirmado', 'lembrete_enviado') AND a.data_hora >= now()
+                 ORDER BY a.data_hora ASC LIMIT 20`,
+                [oficinaId]
             ),
         ]);
 
@@ -134,17 +209,19 @@ router.get("/", exigirAdmin, async (_req, res) => {
 
 router.get("/manutencao", exigirAdmin, async (req, res) => {
     try {
-        const config = await obterConfiguracao();
+        const oficinaId = req.usuario!.oficinaId!;
+        const config = await obterConfiguracao(oficinaId);
         const [planos, proximas, { rows: veiculos }] = await Promise.all([
             listarPlanos(config.segmento),
-            listarProximas(30),
+            listarProximas(oficinaId, 30),
             db.query<{ id: string; label: string }>(
                 `SELECT v.id, (COALESCE(v.marca || ' ', '') || COALESCE(v.modelo, 'veículo') ||
                         ' — ' || c.nome || ' (' || c.telefone || ')') AS label
                  FROM veiculos v
                  JOIN clientes c ON c.id = v.cliente_id
-                 WHERE v.deleted_at IS NULL AND c.deleted_at IS NULL
-                 ORDER BY v.created_at DESC LIMIT 200`
+                 WHERE v.oficina_id = $1 AND v.deleted_at IS NULL AND c.deleted_at IS NULL
+                 ORDER BY v.created_at DESC LIMIT 200`,
+                [oficinaId]
             ),
         ]);
 
@@ -225,15 +302,21 @@ router.get("/manutencao", exigirAdmin, async (req, res) => {
 
 router.post("/manutencao/registrar", exigirAdmin, async (req, res) => {
     try {
+        const oficinaId = req.usuario!.oficinaId!;
         const { veiculoId, planoId, kmAtual } = req.body ?? {};
         if (!veiculoId || !planoId) return res.redirect("/admin/manutencao");
 
-        const { rows } = await db.query<{ cliente_id: string }>("SELECT cliente_id FROM veiculos WHERE id = $1", [veiculoId]);
+        // Filtra por oficina_id -- impede um admin de registrar manutencao
+        // num veiculo que pertence a outra loja (mesmo sabendo o UUID).
+        const { rows } = await db.query<{ cliente_id: string }>(
+            "SELECT cliente_id FROM veiculos WHERE id = $1 AND oficina_id = $2",
+            [veiculoId, oficinaId]
+        );
         const clienteId = rows[0]?.cliente_id;
         if (!clienteId) return res.redirect("/admin/manutencao");
 
         const km = kmAtual ? parseInt(kmAtual, 10) : null;
-        await registrarManutencao({ veiculoId, clienteId, planoId, kmAtual: Number.isFinite(km as number) ? km : null });
+        await registrarManutencao(oficinaId, { veiculoId, clienteId, planoId, kmAtual: Number.isFinite(km as number) ? km : null });
         res.redirect("/admin/manutencao?ok=1");
     } catch (erro) {
         console.error("[admin] erro ao registrar manutencao:", erro);
@@ -243,7 +326,8 @@ router.post("/manutencao/registrar", exigirAdmin, async (req, res) => {
 
 router.get("/configuracao", exigirAdmin, async (req, res) => {
     try {
-        const config = await obterConfiguracao();
+        const oficinaId = req.usuario!.oficinaId!;
+        const config = await obterConfiguracao(oficinaId);
         const onboarding = req.query.onboarding === "1";
 
         const opcoes = (["auto_eletrica", "mecanica", "integrado"] as Segmento[])
@@ -284,11 +368,12 @@ router.get("/configuracao", exigirAdmin, async (req, res) => {
 
 router.post("/configuracao", exigirAdmin, async (req, res) => {
     try {
+        const oficinaId = req.usuario!.oficinaId!;
         const { segmento, nomeOficina, whatsappNumero } = req.body ?? {};
         if (!["auto_eletrica", "mecanica", "integrado"].includes(segmento) || !nomeOficina) {
             return res.redirect("/admin/configuracao");
         }
-        await salvarConfiguracao({ segmento, nomeOficina, whatsappNumero });
+        await salvarConfiguracao(oficinaId, { segmento, nomeOficina, whatsappNumero });
         res.redirect("/admin");
     } catch (erro) {
         console.error("[admin] erro ao salvar configuracao:", erro);
@@ -297,9 +382,9 @@ router.post("/configuracao", exigirAdmin, async (req, res) => {
 });
 
 // Contagem de nao-lidas -- consumido pelo polling do sininho no layout.
-router.get("/notificacoes/count.json", exigirAdmin, async (_req, res) => {
+router.get("/notificacoes/count.json", exigirAdmin, async (req, res) => {
     try {
-        const total = await contarNaoLidas();
+        const total = await contarNaoLidas(req.usuario!.oficinaId!);
         res.json({ total });
     } catch (erro) {
         console.error("[admin] erro ao contar notificacoes:", erro);
@@ -307,10 +392,11 @@ router.get("/notificacoes/count.json", exigirAdmin, async (_req, res) => {
     }
 });
 
-router.get("/notificacoes", exigirAdmin, async (_req, res) => {
+router.get("/notificacoes", exigirAdmin, async (req, res) => {
     try {
-        const itens = await listarNotificacoes(50);
-        await marcarTodasLidas(); // abrir a lista marca tudo como lido
+        const oficinaId = req.usuario!.oficinaId!;
+        const itens = await listarNotificacoes(oficinaId, 50);
+        await marcarTodasLidas(oficinaId); // abrir a lista marca tudo como lido
 
         const ICONE: Record<string, string> = { novo_agendamento: "🗓️", urgencia: "⚠️" };
         const linhas =

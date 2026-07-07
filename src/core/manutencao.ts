@@ -29,13 +29,16 @@ export async function listarPlanos(segmento: Segmento): Promise<Plano[]> {
  * pela tela do admin; quando o modulo os-estoque marcar uma OS como entregue,
  * deve chamar esta mesma funcao para cada servico recorrente lancado.
  */
-export async function registrarManutencao(params: {
-    veiculoId: string;
-    clienteId: string;
-    planoId: string;
-    kmAtual?: number | null;
-    osId?: string | null;
-}): Promise<{ id: string; proximaData: Date | null } | { erro: string }> {
+export async function registrarManutencao(
+    oficinaId: string,
+    params: {
+        veiculoId: string;
+        clienteId: string;
+        planoId: string;
+        kmAtual?: number | null;
+        osId?: string | null;
+    }
+): Promise<{ id: string; proximaData: Date | null } | { erro: string }> {
     const { rows: planoRows } = await db.query<{ intervalo_km: number | null; intervalo_meses: number | null }>(
         "SELECT intervalo_km, intervalo_meses FROM planos_manutencao WHERE id = $1 AND ativo = true",
         [params.planoId]
@@ -57,10 +60,11 @@ export async function registrarManutencao(params: {
 
     const { rows } = await db.query<{ id: string }>(
         `INSERT INTO manutencoes_realizadas
-            (veiculo_id, cliente_id, plano_id, km_na_realizacao, proximo_km, proxima_data, os_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (oficina_id, veiculo_id, cliente_id, plano_id, km_na_realizacao, proximo_km, proxima_data, os_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING id`,
         [
+            oficinaId,
             params.veiculoId,
             params.clienteId,
             params.planoId,
@@ -73,7 +77,11 @@ export async function registrarManutencao(params: {
 
     // Atualiza a km conhecida do veiculo (util pra estimativas futuras).
     if (params.kmAtual) {
-        await db.query("UPDATE veiculos SET quilometragem_atual = $2 WHERE id = $1", [params.veiculoId, params.kmAtual]);
+        await db.query("UPDATE veiculos SET quilometragem_atual = $2 WHERE id = $1 AND oficina_id = $3", [
+            params.veiculoId,
+            params.kmAtual,
+            oficinaId,
+        ]);
     }
 
     return { id: rows[0].id, proximaData };
@@ -90,7 +98,7 @@ export interface ProximaManutencao {
 }
 
 /** Lista as manutencoes com lembrete pendente ou ja enviado, mais proximas primeiro. */
-export async function listarProximas(limite = 30): Promise<ProximaManutencao[]> {
+export async function listarProximas(oficinaId: string, limite = 30): Promise<ProximaManutencao[]> {
     const { rows } = await db.query<ProximaManutencao>(
         `SELECT m.id, m.proxima_data, m.proximo_km, m.status,
                 p.nome AS servico, c.nome AS cliente_nome, v.modelo AS veiculo_modelo
@@ -98,10 +106,10 @@ export async function listarProximas(limite = 30): Promise<ProximaManutencao[]> 
          JOIN planos_manutencao p ON p.id = m.plano_id
          JOIN clientes c ON c.id = m.cliente_id
          JOIN veiculos v ON v.id = m.veiculo_id
-         WHERE m.status IN ('pendente_lembrete', 'lembrete_enviado')
+         WHERE m.oficina_id = $1 AND m.status IN ('pendente_lembrete', 'lembrete_enviado')
          ORDER BY m.proxima_data ASC NULLS LAST
-         LIMIT $1`,
-        [limite]
+         LIMIT $2`,
+        [oficinaId, limite]
     );
     return rows;
 }

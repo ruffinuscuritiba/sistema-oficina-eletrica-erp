@@ -38,10 +38,12 @@ router.get("/:id", async (req, res) => {
     try {
         const { rows } = await db.query(
             `SELECT a.id, a.data_hora, a.periodo, a.status, a.sintoma,
-                    c.nome AS cliente_nome, v.modelo AS veiculo_modelo, v.placa AS veiculo_placa
+                    c.nome AS cliente_nome, v.modelo AS veiculo_modelo, v.placa AS veiculo_placa,
+                    o.nome AS oficina_nome
              FROM agendamentos a
              JOIN clientes c ON c.id = a.cliente_id
              LEFT JOIN veiculos v ON v.id = a.veiculo_id
+             JOIN oficinas o ON o.id = a.oficina_id
              WHERE a.id = $1`,
             [req.params.id]
         );
@@ -71,7 +73,7 @@ router.get("/:id", async (req, res) => {
                  <div class="linha"><span>Data e hora</span><span>${dataFormatada}</span></div>
                  ${ag.veiculo_modelo ? `<div class="linha"><span>Veículo</span><span>${ag.veiculo_modelo}${ag.veiculo_placa && ag.veiculo_placa !== "A_INFORMAR" ? " · " + ag.veiculo_placa : ""}</span></div>` : ""}
                  <div class="linha"><span>Relato</span><span>${(ag.sintoma ?? "").slice(0, 60)}</span></div>
-                 <p class="rodape">Precisa remarcar ou cancelar? É só mandar uma mensagem no WhatsApp da oficina.</p>`
+                 <p class="rodape">${ag.oficina_nome} — precisa remarcar ou cancelar? É só mandar uma mensagem no WhatsApp da oficina.</p>`
             )
         );
     } catch (erro) {

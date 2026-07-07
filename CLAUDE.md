@@ -18,7 +18,7 @@ Memória técnica resumida do projeto. Consultar **antes** de explorar o código
 
 ## Arquitetura
 
-Sistema **single-tenant por deploy**: cada oficina que contrata roda sua própria instância isolada (não é multi-tenant como o food-system-Sas-ERP). A tabela `configuracao_oficina` é um singleton (1 linha fixa) que guarda **qual sistema essa instância roda**: `auto_eletrica`, `mecanica` ou `integrado`. Esse valor não é só um rótulo — ele muda de verdade:
+**Multi-tenant desde 01/07/2026** (ver seção dedicada mais abaixo): 1 deploy/banco atende N oficinas ("lojas"), cada uma isolada por `oficina_id`. Antes disso o sistema era single-tenant por deploy (1 instância = 1 oficina) — essa era a arquitetura original, hoje superada pela migration `db/007_multi_tenant.sql`. A tabela `oficinas` (substituiu o singleton `configuracao_oficina`) guarda, por linha, **qual sistema aquela loja contratou**: `auto_eletrica`, `mecanica` ou `integrado`. Esse valor não é só um rótulo — ele muda de verdade:
 
 - quais categorias de serviço a IA classifica (`CATEGORIAS_POR_SEGMENTO`)
 - quais palavras indicam urgência/emergência (`URGENCIA_POR_SEGMENTO`)
@@ -53,26 +53,32 @@ Serviços NÃO oferecidos por segmento (equipamento/especialidade real, não é 
 db/
   schema.sql                       # schema base (cadastros, OS, estoque, PDV, localização, integrações)
   002_atendimento_ia.sql           # agendamentos + atendimento_conversas (estado da conversa)
-  003_configuracao_oficina.sql     # singleton do segmento contratado
+  003_configuracao_oficina.sql     # singleton do segmento contratado (SUPERADO pela 007 — tabela some na 008 futura)
   004_notificacoes_controle.sql    # idempotência dos jobs automáticos
+  005_manutencao_preventiva.sql    # planos_manutencao + manutencoes_realizadas
+  006_notificacoes_painel.sql      # sininho do painel
+  007_multi_tenant.sql             # tabela oficinas + oficina_id em toda tabela tenant-scoped (ver seção Multi-tenant)
 scripts/
-  seed.js                          # cria admin inicial + postos de trabalho padrão
+  seed.js                          # cria super_admin inicial + admin/postos da oficina seed
 src/
   core/
     module-registry.ts             # registro genérico de módulos (padrão já existia)
     db.ts                          # Pool do pg compartilhado
-    auth.ts                        # JWT + middleware exigirAdmin
-    config-oficina.ts              # ler/salvar configuracao_oficina
+    auth.ts                        # JWT (com oficinaId) + middlewares exigirAdmin / exigirSuperAdmin
+    config-oficina.ts              # ler/salvar 1 linha de "oficinas" por oficinaId
     segmentos.ts                   # TUDO que muda por segmento (categorias, urgência, perguntas, duração)
-    jobs.ts                        # setInterval: lembrete de agendamento + avaliação pós-serviço
+    manutencao.ts                  # registrar/listar manutenção preventiva (por oficinaId)
+    notificacoes-painel.ts         # sininho do painel (por oficinaId)
+    jobs.ts                        # setInterval: roda os 3 jobs POR OFICINA ATIVA
   modules/
-    admin/                         # login + painel server-rendered (protegido por JWT em cookie)
-    agendamento-publico/           # GET /agendamento/:id — página pública de confirmação
+    admin/                         # login + painel server-rendered de UMA loja (protegido por JWT em cookie)
+    super-admin/                   # login + painel que lista/cria/edita/ativa TODAS as lojas
+    agendamento-publico/           # GET /agendamento/:id — página pública de confirmação (mostra nome da loja)
     integracoes/whatsapp-ia/       # webhook Evolution API + máquina de estados da triagem
       evolution-client.ts          # enviar mensagem + extrair payload (v1/v2), no-op se API não configurada
       triagem.ts                   # classificar sintoma (IA com fallback por palavra-chave), por segmento
-      agendamento.service.ts       # calcular horários livres + confirmar agendamento (com re-checagem de corrida)
-      conversa.service.ts          # máquina de estados: inicio → dados → sintoma → mídia → período → horário → concluído
+      agendamento.service.ts       # calcular horários livres + confirmar agendamento (por oficinaId, com re-checagem de corrida)
+      conversa.service.ts          # máquina de estados: inicio → dados → sintoma → mídia → período → horário → concluído (por oficinaId)
 ```
 
 ---
@@ -109,16 +115,17 @@ Comando `cancelar` funciona em qualquer estado `concluido` (libera a vaga).
 
 **Idempotência dos jobs automáticos**: lembrete de agendamento consome o próprio `agendamentos.status` (`confirmado` → `lembrete_enviado`, nunca reenvia). Avaliação pós-serviço usa `notificacoes_enviadas (tipo, referencia_id)` com `UNIQUE` — nunca manda duas vezes pra mesma OS.
 
-**Onboarding obrigatório**: `configuracao_oficina.configurado_em IS NULL` força redirect pra `/admin/configuracao` antes de liberar o painel — a oficina não usa o sistema sem escolher o segmento primeiro.
+**Onboarding obrigatório**: `oficinas.configurado_em IS NULL` força redirect pra `/admin/configuracao` antes de liberar o painel — a oficina não usa o sistema sem escolher o segmento primeiro. Lojas criadas pelo super-admin (`POST /super-admin/lojas/nova`) já nascem com `configurado_em` preenchido (pulam o onboarding, já que o segmento é escolhido na hora da criação).
 
 ---
 
 ## Autenticação
 
-- `POST /admin/login` — verifica `usuarios.senha_hash` (bcrypt) → gera JWT (8h) → cookie `admin_token` (httpOnly, sameSite=lax, secure em produção).
-- `GET /admin/*` protegido por `exigirAdmin` (middleware em `core/auth.ts`) — sem cookie válido, redireciona pra `/admin/login`.
+- `POST /admin/login` — busca `usuarios` por e-mail (não é mais único globalmente, e sim por `(email, oficina_id)` — a mesma pessoa pode ter conta em 2+ lojas). Verifica `senha_hash` (bcrypt) → gera JWT (8h, payload agora inclui `oficinaId`) → cookie `admin_token` (httpOnly, sameSite=lax, secure em produção). Se o e-mail bater em mais de uma loja ativa, mostra uma tela extra "qual loja é essa?" antes de completar o login.
+- `GET /admin/*` protegido por `exigirAdmin` (middleware em `core/auth.ts`) — sem cookie válido, redireciona pra `/admin/login`. Login é bloqueado se a loja do usuário estiver `ativo=false` (desativada pelo super-admin).
+- `POST /super-admin/login` — mesma lógica, mas só aceita `usuarios.papel = 'super_admin'` (que sempre tem `oficina_id = NULL`). Protegido por `exigirSuperAdmin`.
 - **JWT_SECRET obrigatório em produção** — o app lança erro no boot se não estiver setado (só usa fallback dev fora de `NODE_ENV=production`).
-- `usuarios.papel` existe no schema (`admin`, `atendente`, `mecanico`, `financeiro`) mas o painel admin atual não distingue por papel — qualquer usuário ativo pode logar. Se precisar restringir por papel no futuro, o campo já está disponível em `req.usuario.papel` após `exigirAdmin`.
+- `usuarios.papel` (`admin`, `atendente`, `mecanico`, `financeiro`, `super_admin`) — o painel admin de loja ainda não distingue por papel dentro da própria loja (qualquer usuário ativo dessa loja pode logar); `super_admin` é o único papel com tratamento de fato diferente (painel próprio, sem `oficina_id`).
 
 ---
 
@@ -207,3 +214,52 @@ Quando a IA confirma um agendamento (ou detecta urgência), a oficina é avisada
 Validado em produção: fluxo de agendamento e de urgência disparam os dois canais; sininho conta e zera ao abrir a lista; mensagem completa chega no WhatsApp da empresa. Dados de teste limpos e config resetada pro onboarding.
 
 **Nota sobre o link de confirmação** (`/agendamento/:id`): funciona (testado 200 em produção com UUID real). O `{id}` que aparece na doc é só placeholder — o link real gerado por cada agendamento usa o UUID de verdade. IDs inválidos/inexistentes caem numa página amigável ("Link inválido"/"não encontrado"), não em erro.
+
+---
+
+## Multi-tenant — Fase 1 (01/07/2026): 1 deploy atende N lojas
+
+O usuário pediu pra transformar o sistema (que era 1 deploy = 1 oficina) em multi-loja de verdade, com um painel único listando/criando lojas — no mesmo espírito do super-admin do food-system-Sas-ERP. Implementado em fases: **Fase 1** (esta) = fundação multi-tenant completa (tabela de lojas, super-admin, todo dado isolado por `oficina_id`). **Fase 2** (futura, não implementada) = cada loja com sua própria instância/número Evolution API — hoje ainda existe só 1 WhatsApp por deploy, compartilhado entre todas as lojas.
+
+### O que mudou
+
+- **Tabela `oficinas`** substitui o singleton `configuracao_oficina` (que fica no banco, inerte, até a migration de limpeza `008` rodar). 1 linha por loja: `nome`, `segmento`, `whatsapp_numero`, `ativo`, `configurado_em`.
+- **`oficina_id`** adicionado (com `DEFAULT` pro UUID da loja migrada, `'00000000-0000-0000-0000-000000000001'`) em: `usuarios`, `clientes`, `veiculos`, `agendamentos`, `atendimento_conversas`, `notificacoes_painel`, `manutencoes_realizadas`, `postos_trabalho`, `ordens_servico`. **Não** entraram: `notificacoes_enviadas` (idempotência por `referencia_id`, já único) e `planos_manutencao` (catálogo de referência compartilhado entre todas as lojas, filtrado só por `segmento`).
+- **`usuarios.papel`** ganhou `'super_admin'` — único papel com `oficina_id IS NULL` (CHECK garante essa coerência). E-mail deixou de ser único globalmente: agora é único por `(email, oficina_id)`, com índice parcial separado pro e-mail de super_admin.
+- **`atendimento_conversas`**: `telefone` deixou de ser PK sozinho (2 lojas podem ter cliente com o mesmo número) — virou `UNIQUE(telefone, oficina_id)`.
+- **`src/core/jobs.ts`**: os 3 jobs automáticos (lembrete, avaliação pós-serviço, preventiva) agora rodam **em loop por cada oficina ativa**, não mais 1x global.
+- **Novo módulo `src/modules/super-admin/`**: login próprio, lista de lojas com KPIs (clientes/agendamentos), criar loja (+ primeiro admin dela na mesma transação), editar loja, ativar/desativar.
+
+### Como acessar (local e produção)
+
+| | URL | Credenciais (seed) |
+|---|---|---|
+| **Super-admin** (todas as lojas) | `/super-admin/login` | `superadmin@oficina.com` / `SuperAdmin@2026` (env `SEED_SUPERADMIN_EMAIL`/`SEED_SUPERADMIN_SENHA`) |
+| **Admin da loja seed** ("Minha Oficina", a que já existia antes da migration) | `/admin/login` | `admin@oficina.com` / `Oficina@2026` (env `SEED_ADMIN_EMAIL`/`SEED_ADMIN_SENHA`) |
+| **Lojas novas** | `/admin/login` | credenciais definidas na hora da criação em `/super-admin/lojas/nova` |
+
+Em produção: `https://oficina-api.srv1747711.hstgr.cloud/super-admin/login`. **O link do super-admin não aparece em nenhum menu/UI** — é proposital (persona/login separados do admin de loja); acesse direto pela URL.
+
+### Resolução da oficina no WhatsApp (Fase 1, limitação conhecida)
+
+Como só existe 1 instância Evolution API por deploy, `conversa.service.ts` resolve a oficina de toda mensagem recebida com `SELECT id FROM oficinas ORDER BY created_at ASC LIMIT 1` (sempre a loja mais antiga = a seed). **Se uma 2ª loja for criada, mensagens de WhatsApp dela ainda vão cair na loja seed** até a Fase 2 (roteamento real por instância/número, no padrão `WhatsappConnection` do food-system-Sas-ERP) ser implementada. O resto do sistema (painel, isolamento de dados, jobs) já funciona corretamente pra N lojas — só o roteamento de WhatsApp é single-instância por enquanto.
+
+### Migration 007 — idempotência (bug real encontrado e corrigido)
+
+`ADD CONSTRAINT ... UNIQUE` cria um índice de apoio catalogado como "relation" — colisão de nome ao reexecutar levanta `duplicate_table` (42P07), **não** `duplicate_object` (42710) como as outras constraints. Mesma pegadinha já documentada no projeto irmão pra `CREATE TABLE`. Corrigido no bloco de `atendimento_conversas` (`EXCEPTION WHEN duplicate_object OR duplicate_table`). Validado rodando a migration 3x seguidas sem erro.
+
+### Rollout em produção (dados reais, sem downtime)
+
+1. Backup (`pg_dump`) antes de tudo.
+2. Rodar `db/007_multi_tenant.sql` manualmente no Postgres de produção **antes** de deployar o código novo — seguro porque todo `ADD COLUMN` tem `DEFAULT` pro UUID da loja seed, então o código ANTIGO (que não sabe de `oficina_id`) continua funcionando sem quebrar nenhum INSERT durante a janela entre migration e deploy.
+3. Conferir contagens de linha antes/depois + `SELECT * FROM oficinas` (1 linha, dados corretos da oficina real).
+4. Só então buildar/deployar o código novo (lembrar: `docker compose build --no-cache` manual — botão "Implantar" da UI Hostinger não builda).
+5. Rodar `node scripts/seed.js` de novo em produção **uma vez** pós-deploy — cria o `super_admin` inicial (a condição "se não existe nenhum" não disparava antes porque só checava `usuarios` em geral, agora checa especificamente por papel).
+6. Smoke test: login do admin atual funciona, dashboard mostra os dados de sempre, 1 mensagem de teste no WhatsApp fim-a-fim, jobs sem duplicar envio.
+7. `configuracao_oficina` fica inerte no banco (não apagada) como rede de segurança — só remover numa migration `008` separada, depois de alguns dias estável.
+
+### Validado localmente (01/07/2026)
+
+Migrations 001→007 rodam limpo do zero (Postgres 18 local, fora de Docker — Docker Desktop indisponível na sessão); 007 idempotente (3 execuções). Testado via curl simulando o servidor rodando: login super-admin, listagem de lojas, criação de 2ª e 3ª loja (+ primeiro admin de cada), login da loja nova, **isolamento confirmado** (mensagem de WhatsApp simulada criou cliente só na loja seed, dashboard da 2ª loja permaneceu zerado), bloqueio cross-tenant testado (admin da loja 2 não conseguiu registrar manutenção num veículo da loja seed — silenciosamente rejeitado), toggle ativo/inativo bloqueia login da loja desativada, tela de "escolha sua loja" funciona quando o mesmo e-mail existe em 2+ lojas, página pública `/agendamento/:id` mostra o nome da loja correta.
+
+**Pendente**: aplicar em produção (passos do Rollout acima) — não foi feito nesta sessão, só validado localmente.

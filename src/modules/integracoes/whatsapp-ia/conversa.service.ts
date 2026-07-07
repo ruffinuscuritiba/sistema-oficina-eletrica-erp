@@ -9,21 +9,36 @@ import { buscarProximosHorarios, confirmarAgendamento } from "./agendamento.serv
 const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
 
 /**
+ * Resolve a qual oficina uma mensagem recebida pertence. Na Fase 1 (1
+ * instancia Evolution API pra todo o deploy) so existe "a oficina migrada" --
+ * pega a mais antiga cadastrada. Fase 2 troca isto por resolucao real via
+ * instancia/numero do Evolution que recebeu o webhook.
+ */
+async function resolverOficinaAtual(): Promise<string> {
+    const { rows } = await db.query<{ id: string }>("SELECT id FROM oficinas ORDER BY created_at ASC LIMIT 1");
+    if (!rows[0]) throw new Error("Nenhuma oficina cadastrada -- rode a migration/seed antes de receber mensagens.");
+    return rows[0].id;
+}
+
+/**
  * Avisa a oficina de um evento (novo agendamento / urgencia): grava no sininho
  * do painel (PDV) E manda no WhatsApp da empresa, se o numero estiver configurado.
  * Best-effort -- nunca deixa uma falha de notificacao quebrar o atendimento.
  */
-async function notificarEmpresa(params: {
-    tipo: "novo_agendamento" | "urgencia";
-    titulo: string;
-    descricao: string;
-    referenciaId?: string | null;
-    link?: string | null;
-    whatsappNumero: string | null;
-    mensagemWhatsapp: string;
-}): Promise<void> {
+async function notificarEmpresa(
+    oficinaId: string,
+    params: {
+        tipo: "novo_agendamento" | "urgencia";
+        titulo: string;
+        descricao: string;
+        referenciaId?: string | null;
+        link?: string | null;
+        whatsappNumero: string | null;
+        mensagemWhatsapp: string;
+    }
+): Promise<void> {
     try {
-        await criarNotificacao({
+        await criarNotificacao(oficinaId, {
             tipo: params.tipo,
             titulo: params.titulo,
             descricao: params.descricao,
@@ -92,27 +107,27 @@ function formatarSlot(data: Date): string {
     return ehHoje ? `Hoje, ${horario}h` : `${dia.charAt(0).toUpperCase() + dia.slice(1)}, ${horario}h`;
 }
 
-async function carregarOuCriarConversa(telefone: string): Promise<ConversaRow> {
+async function carregarOuCriarConversa(oficinaId: string, telefone: string): Promise<ConversaRow> {
     const { rows } = await db.query<ConversaRow>(
-        "SELECT telefone, cliente_id, estado, contexto FROM atendimento_conversas WHERE telefone = $1",
-        [telefone]
+        "SELECT telefone, cliente_id, estado, contexto FROM atendimento_conversas WHERE telefone = $1 AND oficina_id = $2",
+        [telefone, oficinaId]
     );
     if (rows[0]) return rows[0];
 
     const { rows: novas } = await db.query<ConversaRow>(
-        `INSERT INTO atendimento_conversas (telefone, estado, contexto)
-         VALUES ($1, 'inicio', '{}') RETURNING telefone, cliente_id, estado, contexto`,
-        [telefone]
+        `INSERT INTO atendimento_conversas (telefone, oficina_id, estado, contexto)
+         VALUES ($1, $2, 'inicio', '{}') RETURNING telefone, cliente_id, estado, contexto`,
+        [telefone, oficinaId]
     );
     return novas[0];
 }
 
-async function salvarConversa(telefone: string, estado: Estado, contexto: Contexto, clienteId?: string | null) {
+async function salvarConversa(oficinaId: string, telefone: string, estado: Estado, contexto: Contexto, clienteId?: string | null) {
     await db.query(
         `UPDATE atendimento_conversas
-         SET estado = $2, contexto = $3, cliente_id = COALESCE($4, cliente_id), ultima_interacao = now()
-         WHERE telefone = $1`,
-        [telefone, estado, JSON.stringify(contexto), clienteId ?? null]
+         SET estado = $3, contexto = $4, cliente_id = COALESCE($5, cliente_id), ultima_interacao = now()
+         WHERE telefone = $1 AND oficina_id = $2`,
+        [telefone, oficinaId, estado, JSON.stringify(contexto), clienteId ?? null]
     );
 }
 
@@ -130,10 +145,10 @@ async function responder(telefone: string, clienteId: string | null, texto: stri
 }
 
 /** Busca o cliente pelo telefone e, se existir, o veiculo mais recente dele. */
-async function buscarClienteExistente(telefone: string) {
+async function buscarClienteExistente(oficinaId: string, telefone: string) {
     const { rows } = await db.query<{ id: string; nome: string }>(
-        "SELECT id, nome FROM clientes WHERE telefone = $1 AND deleted_at IS NULL LIMIT 1",
-        [telefone]
+        "SELECT id, nome FROM clientes WHERE oficina_id = $1 AND telefone = $2 AND deleted_at IS NULL LIMIT 1",
+        [oficinaId, telefone]
     );
     if (!rows[0]) return null;
 
@@ -149,7 +164,8 @@ async function buscarClienteExistente(telefone: string) {
 export async function processarMensagem(telefoneOriginal: string, textoOriginal: string, temMidia: boolean): Promise<void> {
     const telefone = normalizarTelefone(telefoneOriginal);
     const texto = textoOriginal.trim();
-    const [conversa, config] = await Promise.all([carregarOuCriarConversa(telefone), obterConfiguracao()]);
+    const oficinaId = await resolverOficinaAtual();
+    const [conversa, config] = await Promise.all([carregarOuCriarConversa(oficinaId, telefone), obterConfiguracao(oficinaId)]);
     const NOME_OFICINA = config.nomeOficina || process.env.OFICINA_NOME || "nossa oficina";
     const segmento: Segmento = config.segmento;
     await registrarLog(telefone, conversa.cliente_id, "entrada", texto || "[midia]");
@@ -160,9 +176,9 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
     if (/^cancelar$/i.test(texto) && conversa.estado === "concluido") {
         await db.query(
             `UPDATE agendamentos SET status = 'cancelado'
-             WHERE cliente_id = $1 AND status IN ('confirmado', 'lembrete_enviado')
-             AND id = (SELECT id FROM agendamentos WHERE cliente_id = $1 AND status IN ('confirmado','lembrete_enviado') ORDER BY data_hora DESC LIMIT 1)`,
-            [conversa.cliente_id]
+             WHERE oficina_id = $1 AND cliente_id = $2 AND status IN ('confirmado', 'lembrete_enviado')
+             AND id = (SELECT id FROM agendamentos WHERE oficina_id = $1 AND cliente_id = $2 AND status IN ('confirmado','lembrete_enviado') ORDER BY data_hora DESC LIMIT 1)`,
+            [oficinaId, conversa.cliente_id]
         );
         await responder(telefone, conversa.cliente_id, "Prontinho, cancelei sua vaga. Se quiser remarcar é só chamar de novo por aqui! 👋");
         return;
@@ -170,7 +186,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
 
     switch (conversa.estado) {
         case "inicio": {
-            const existente = await buscarClienteExistente(telefone);
+            const existente = await buscarClienteExistente(oficinaId, telefone);
             if (existente) {
                 contexto.clienteId = existente.cliente.id;
                 if (existente.veiculo) {
@@ -182,7 +198,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                         existente.veiculo.placa && existente.veiculo.placa !== "A_INFORMAR"
                             ? ` (placa ${existente.veiculo.placa})`
                             : "";
-                    await salvarConversa(telefone, "aguardando_confirmacao_veiculo", contexto, existente.cliente.id);
+                    await salvarConversa(oficinaId, telefone, "aguardando_confirmacao_veiculo", contexto, existente.cliente.id);
                     await responder(
                         telefone,
                         existente.cliente.id,
@@ -191,7 +207,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                     );
                     return;
                 }
-                await salvarConversa(telefone, "aguardando_sintoma", contexto, existente.cliente.id);
+                await salvarConversa(oficinaId, telefone, "aguardando_sintoma", contexto, existente.cliente.id);
                 await responder(
                     telefone,
                     existente.cliente.id,
@@ -200,7 +216,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                 return;
             }
 
-            await salvarConversa(telefone, "aguardando_dados", contexto);
+            await salvarConversa(oficinaId, telefone, "aguardando_dados", contexto);
             await responder(
                 telefone,
                 null,
@@ -227,21 +243,21 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             }
 
             const { rows: clienteRows } = await db.query<{ id: string }>(
-                `INSERT INTO clientes (nome, telefone) VALUES ($1, $2) RETURNING id`,
-                [nome, telefone]
+                `INSERT INTO clientes (oficina_id, nome, telefone) VALUES ($1, $2, $3) RETURNING id`,
+                [oficinaId, nome, telefone]
             );
             const clienteId = clienteRows[0].id;
 
             const { rows: veiculoRows } = await db.query<{ id: string }>(
-                `INSERT INTO veiculos (cliente_id, placa, modelo) VALUES ($1, $2, $3) RETURNING id`,
-                [clienteId, "A_INFORMAR", veiculoDescricao]
+                `INSERT INTO veiculos (oficina_id, cliente_id, placa, modelo) VALUES ($1, $2, $3, $4) RETURNING id`,
+                [oficinaId, clienteId, "A_INFORMAR", veiculoDescricao]
             );
 
             contexto.clienteId = clienteId;
             contexto.veiculoId = veiculoRows[0].id;
             contexto.veiculoDescricao = veiculoDescricao;
 
-            await salvarConversa(telefone, "aguardando_sintoma", contexto, clienteId);
+            await salvarConversa(oficinaId, telefone, "aguardando_sintoma", contexto, clienteId);
             await responder(
                 telefone,
                 clienteId,
@@ -255,13 +271,13 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
         case "aguardando_confirmacao_veiculo": {
             if (!apenasSim(texto)) {
                 const { rows: veiculoRows } = await db.query<{ id: string }>(
-                    `INSERT INTO veiculos (cliente_id, placa, modelo) VALUES ($1, $2, $3) RETURNING id`,
-                    [contexto.clienteId, "A_INFORMAR", texto]
+                    `INSERT INTO veiculos (oficina_id, cliente_id, placa, modelo) VALUES ($1, $2, $3, $4) RETURNING id`,
+                    [oficinaId, contexto.clienteId, "A_INFORMAR", texto]
                 );
                 contexto.veiculoId = veiculoRows[0].id;
                 contexto.veiculoDescricao = texto;
             }
-            await salvarConversa(telefone, "aguardando_sintoma", contexto);
+            await salvarConversa(oficinaId, telefone, "aguardando_sintoma", contexto);
             await responder(
                 telefone,
                 contexto.clienteId ?? null,
@@ -277,7 +293,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             contexto.urgente = classificacao.urgente;
 
             if (classificacao.urgente) {
-                await salvarConversa(telefone, "urgente_transferido", contexto);
+                await salvarConversa(oficinaId, telefone, "urgente_transferido", contexto);
                 await responder(
                     telefone,
                     contexto.clienteId ?? null,
@@ -292,7 +308,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                     [contexto.clienteId]
                 );
                 const nomeCli = cliRows[0]?.nome ?? "Cliente";
-                await notificarEmpresa({
+                await notificarEmpresa(oficinaId, {
                     tipo: "urgencia",
                     titulo: `⚠️ URGÊNCIA — ${nomeCli}`,
                     descricao: `${contexto.veiculoDescricao ?? "veículo"} · ${texto}`.slice(0, 300),
@@ -309,7 +325,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
 
             // Pergunta extra muda de verdade conforme o segmento contratado
             // (elétrica pergunta luz do painel/código de erro; mecânica pergunta km/tipo de barulho).
-            await salvarConversa(telefone, "aguardando_midia_ou_pular", contexto);
+            await salvarConversa(oficinaId, telefone, "aguardando_midia_ou_pular", contexto);
             await responder(
                 telefone,
                 contexto.clienteId ?? null,
@@ -324,7 +340,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             if (temMidia) contexto.midiaRecebida = true;
             if (texto && !/^pular$/i.test(texto)) contexto.detalheExtra = texto.slice(0, 300);
 
-            await salvarConversa(telefone, "aguardando_periodo", contexto);
+            await salvarConversa(oficinaId, telefone, "aguardando_periodo", contexto);
             await responder(
                 telefone,
                 contexto.clienteId ?? null,
@@ -346,7 +362,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             }
 
             contexto.periodo = periodo;
-            const slots = await buscarProximosHorarios(periodo, contexto.categoria ?? "outro", segmento);
+            const slots = await buscarProximosHorarios(oficinaId, periodo, contexto.categoria ?? "outro", segmento);
 
             if (slots.length === 0) {
                 await responder(
@@ -355,14 +371,14 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
                     `Poxa, não encontrei vaga nos próximos dias nesse período. Um consultor vai te chamar por aqui em breve pra encontrarmos um horário juntos.`,
                     true
                 );
-                await salvarConversa(telefone, "concluido", contexto);
+                await salvarConversa(oficinaId, telefone, "concluido", contexto);
                 return;
             }
 
             contexto.slotsOferecidos = slots.map((s) => s.dataHora.toISOString());
             const listaTexto = slots.map((s, i) => `🗓️ *${i + 1}* - ${formatarSlot(s.dataHora)}`).join("\n");
 
-            await salvarConversa(telefone, "aguardando_escolha_horario", contexto);
+            await salvarConversa(oficinaId, telefone, "aguardando_escolha_horario", contexto);
             await responder(
                 telefone,
                 contexto.clienteId ?? null,
@@ -382,7 +398,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
 
             const dataHora = new Date(slotsIso[escolha - 1]);
             const sintomaCompleto = [contexto.sintoma, contexto.detalheExtra].filter(Boolean).join(" — ");
-            const resultado = await confirmarAgendamento({
+            const resultado = await confirmarAgendamento(oficinaId, {
                 clienteId: contexto.clienteId!,
                 veiculoId: contexto.veiculoId ?? null,
                 dataHora,
@@ -394,10 +410,10 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             });
 
             if ("conflito" in resultado) {
-                const novosSlots = await buscarProximosHorarios(contexto.periodo!, contexto.categoria ?? "outro", segmento);
+                const novosSlots = await buscarProximosHorarios(oficinaId, contexto.periodo!, contexto.categoria ?? "outro", segmento);
                 contexto.slotsOferecidos = novosSlots.map((s) => s.dataHora.toISOString());
                 const listaTexto = novosSlots.map((s, i) => `🗓️ *${i + 1}* - ${formatarSlot(s.dataHora)}`).join("\n");
-                await salvarConversa(telefone, "aguardando_escolha_horario", contexto);
+                await salvarConversa(oficinaId, telefone, "aguardando_escolha_horario", contexto);
                 await responder(
                     telefone,
                     contexto.clienteId ?? null,
@@ -407,7 +423,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             }
 
             const link = `${PUBLIC_URL}/agendamento/${resultado.id}`;
-            await salvarConversa(telefone, "concluido", contexto);
+            await salvarConversa(oficinaId, telefone, "concluido", contexto);
             await responder(
                 telefone,
                 contexto.clienteId ?? null,
@@ -423,7 +439,7 @@ export async function processarMensagem(telefoneOriginal: string, textoOriginal:
             );
             const nomeCli = cliRows[0]?.nome ?? "Cliente";
             const veic = contexto.veiculoDescricao ?? "veículo";
-            await notificarEmpresa({
+            await notificarEmpresa(oficinaId, {
                 tipo: "novo_agendamento",
                 titulo: `Novo agendamento — ${nomeCli}`,
                 descricao: `${veic} · ${formatarSlot(dataHora)} · ${sintomaCompleto || contexto.sintoma || ""}`.slice(0, 300),

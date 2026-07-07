@@ -8,14 +8,16 @@ const INTERVALO_MS = 5 * 60 * 1000; // 5 minutos
  * Reduz no-show de verdade: manda lembrete ~1h antes do horario confirmado
  * (nao e so a promessa no texto de boas-vindas -- e um job que roda mesmo).
  */
-async function enviarLembretes(): Promise<void> {
+async function enviarLembretes(oficinaId: string): Promise<void> {
     const { rows } = await db.query(
         `SELECT a.id, a.data_hora, c.telefone, c.nome
          FROM agendamentos a
          JOIN clientes c ON c.id = a.cliente_id
-         WHERE a.status = 'confirmado'
+         WHERE a.oficina_id = $1
+           AND a.status = 'confirmado'
            AND a.data_hora > now()
-           AND a.data_hora <= now() + interval '65 minutes'`
+           AND a.data_hora <= now() + interval '65 minutes'`,
+        [oficinaId]
     );
 
     for (const ag of rows as any[]) {
@@ -38,18 +40,20 @@ async function enviarLembretes(): Promise<void> {
  * notificacoes_enviadas -- roda a cada 5min e nunca manda duas vezes pra
  * mesma OS.
  */
-async function enviarAvaliacoesPosServico(): Promise<void> {
-    const config = await obterConfiguracao();
+async function enviarAvaliacoesPosServico(oficinaId: string): Promise<void> {
+    const config = await obterConfiguracao(oficinaId);
 
     const { rows } = await db.query(
         `SELECT os.id, c.telefone, c.nome
          FROM ordens_servico os
          JOIN clientes c ON c.id = os.cliente_id
-         WHERE os.status = 'entregue'
+         WHERE os.oficina_id = $1
+           AND os.status = 'entregue'
            AND NOT EXISTS (
                SELECT 1 FROM notificacoes_enviadas
                WHERE tipo = 'avaliacao_pos_servico' AND referencia_id = os.id
-           )`
+           )`,
+        [oficinaId]
     );
 
     for (const os of rows as any[]) {
@@ -78,7 +82,7 @@ async function enviarAvaliacoesPosServico(): Promise<void> {
  * Gatilho: proxima_data <= hoje + 10 dias. Idempotente por dois caminhos --
  * status vira 'lembrete_enviado' e ha registro em notificacoes_enviadas.
  */
-async function enviarLembretesPreventivos(): Promise<void> {
+async function enviarLembretesPreventivos(oficinaId: string): Promise<void> {
     const { rows } = await db.query(
         `SELECT m.id, m.proximo_km, c.telefone, c.nome,
                 p.nome AS servico, p.mensagem_template,
@@ -87,13 +91,15 @@ async function enviarLembretesPreventivos(): Promise<void> {
          JOIN planos_manutencao p ON p.id = m.plano_id
          JOIN clientes c ON c.id = m.cliente_id
          JOIN veiculos v ON v.id = m.veiculo_id
-         WHERE m.status = 'pendente_lembrete'
+         WHERE m.oficina_id = $1
+           AND m.status = 'pendente_lembrete'
            AND m.proxima_data IS NOT NULL
            AND m.proxima_data <= (CURRENT_DATE + interval '10 days')
            AND NOT EXISTS (
                SELECT 1 FROM notificacoes_enviadas
                WHERE tipo = 'lembrete_preventivo' AND referencia_id = m.id
-           )`
+           )`,
+        [oficinaId]
     );
 
     for (const m of rows as any[]) {
@@ -115,14 +121,38 @@ async function enviarLembretesPreventivos(): Promise<void> {
     }
 }
 
-function rodarUmaVez(): void {
-    enviarLembretes().catch((erro) => console.error("[jobs] enviarLembretes falhou:", erro));
-    enviarAvaliacoesPosServico().catch((erro) => console.error("[jobs] enviarAvaliacoesPosServico falhou:", erro));
-    enviarLembretesPreventivos().catch((erro) => console.error("[jobs] enviarLembretesPreventivos falhou:", erro));
+/**
+ * Roda os 3 jobs para cada oficina ativa. O envio de WhatsApp em si
+ * (enviarMensagem) continua global na Fase 1 -- so 1 instancia Evolution API
+ * por deploy -- e o que muda aqui e so o LOOP DE DADOS, que agora consulta
+ * cada loja separadamente. Fase 2 (WhatsApp por loja) troca enviarMensagem
+ * por uma versao que sabe qual instancia usar por oficina.
+ */
+async function rodarUmaVez(): Promise<void> {
+    let oficinas: { id: string }[];
+    try {
+        const { rows } = await db.query<{ id: string }>("SELECT id FROM oficinas WHERE ativo = true");
+        oficinas = rows;
+    } catch (erro) {
+        console.error("[jobs] falha ao listar oficinas ativas:", erro);
+        return;
+    }
+
+    for (const { id: oficinaId } of oficinas) {
+        enviarLembretes(oficinaId).catch((erro) => console.error(`[jobs] enviarLembretes falhou (oficina ${oficinaId}):`, erro));
+        enviarAvaliacoesPosServico(oficinaId).catch((erro) =>
+            console.error(`[jobs] enviarAvaliacoesPosServico falhou (oficina ${oficinaId}):`, erro)
+        );
+        enviarLembretesPreventivos(oficinaId).catch((erro) =>
+            console.error(`[jobs] enviarLembretesPreventivos falhou (oficina ${oficinaId}):`, erro)
+        );
+    }
 }
 
 export function iniciarJobsAutomaticos(): void {
-    rodarUmaVez(); // nao espera o primeiro intervalo -- roda logo que o servidor sobe
-    setInterval(rodarUmaVez, INTERVALO_MS);
-    console.log(`[jobs] lembretes, avaliacoes e manutencao preventiva ativos (a cada ${INTERVALO_MS / 60000} min)`);
+    rodarUmaVez().catch((erro) => console.error("[jobs] rodarUmaVez falhou:", erro)); // nao espera o primeiro intervalo -- roda logo que o servidor sobe
+    setInterval(() => {
+        rodarUmaVez().catch((erro) => console.error("[jobs] rodarUmaVez falhou:", erro));
+    }, INTERVALO_MS);
+    console.log(`[jobs] lembretes, avaliacoes e manutencao preventiva ativos por loja (a cada ${INTERVALO_MS / 60000} min)`);
 }
