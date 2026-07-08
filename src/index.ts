@@ -16,6 +16,32 @@ process.on("uncaughtException", (erro) => {
 });
 
 const app = express();
+
+// CORS so para a API JSON (/api/*), consumida pelo frontend Next.js
+// desacoplado (outro dominio). Sem "Access-Control-Allow-Credentials": a
+// autenticacao dessa API e via header "Authorization: Bearer", nao cookie --
+// nao precisa (nem deve) marcar como credentialed. As rotas HTML antigas
+// (/admin, /super-admin) continuam sem CORS, do jeito que sempre estiveram.
+const ORIGENS_PERMITIDAS = (process.env.FRONTEND_ORIGINS ?? "http://localhost:3000,https://sistema-oficina-eletrica-erp.vercel.app")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+app.use("/api", (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && ORIGENS_PERMITIDAS.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (req.method === "OPTIONS") {
+        res.status(204).end();
+        return;
+    }
+    next();
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // formularios do painel admin
 app.use(cookieParser());
@@ -35,6 +61,7 @@ registrarModulos(app, [
     require("./modules/agendamento-publico").default,
     require("./modules/admin").default,
     require("./modules/super-admin").default,
+    require("./modules/api").default,
 ]);
 
 // Error handler global (4 argumentos = Express reconhece como middleware de erro).

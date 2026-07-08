@@ -68,3 +68,42 @@ export function exigirSuperAdmin(req: Request, res: Response, next: NextFunction
     req.usuario = payload;
     next();
 }
+
+/**
+ * Variante das duas checagens acima para o frontend desacoplado (Next.js):
+ * le o token de "Authorization: Bearer <token>" em vez do cookie httpOnly, e
+ * responde 401 JSON em vez de redirecionar (o SPA decide o que fazer).
+ * Nao substitui exigirAdmin/exigirSuperAdmin -- as rotas HTML antigas continuam
+ * usando cookie, sem risco de regressao.
+ */
+function extrairBearer(req: Request): string | null {
+    const header = req.headers.authorization;
+    if (!header?.startsWith("Bearer ")) return null;
+    return header.slice("Bearer ".length).trim() || null;
+}
+
+export function exigirApiAdmin(req: Request, res: Response, next: NextFunction): void {
+    const token = extrairBearer(req);
+    const payload = token ? verificarToken(token) : null;
+
+    if (!payload || payload.papel === "super_admin" || !payload.oficinaId) {
+        res.status(401).json({ erro: "Nao autenticado." });
+        return;
+    }
+
+    req.usuario = payload;
+    next();
+}
+
+export function exigirApiSuperAdmin(req: Request, res: Response, next: NextFunction): void {
+    const token = extrairBearer(req);
+    const payload = token ? verificarToken(token) : null;
+
+    if (!payload || payload.papel !== "super_admin") {
+        res.status(401).json({ erro: "Nao autenticado." });
+        return;
+    }
+
+    req.usuario = payload;
+    next();
+}
